@@ -32,8 +32,8 @@ class MyDataset(Dataset):
 
 def setup_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', default='./Trained_model/pocket_generation.pt', type=str, help='')
-    parser.add_argument('--vocab_path', default="./data/torsion_version/torsion_voc_pocket.csv", type=str, help='')
+    parser.add_argument('--model_path', default='/home/ubuntu/cs224r_project/token_mol/Token-Mol/Trained_model/pocket_generation.pt', type=str, help='')
+    parser.add_argument('--vocab_path', default="./data_2/torsion_version/torsion_voc_pocket.csv", type=str, help='')
     parser.add_argument('--protein_path', default='./example/ARA2A.pkl', type=str, help='')
     parser.add_argument('--output_path', default='output.csv', type=str, help='')
     parser.add_argument('--batch_size', default=25, type=int, required=False, help='batch size')
@@ -108,7 +108,7 @@ if __name__ == '__main__':
     model_path, protein_path = args.model_path, args.protein_path
 
     tokenizer = ExpressionBertTokenizer.from_pretrained(args.vocab_path)
-    model = Token3D(pretrain_path='./Pretrained_model', config=Ada_config)
+    model = Token3D(pretrain_path='/home/ubuntu/cs224r_project/token_mol/Token-Mol/Pretrained_model', config=Ada_config)
 
     param_dict = {key.replace("module.", ""): value for key, value in torch.load(model_path, map_location='cuda').items()}
 
