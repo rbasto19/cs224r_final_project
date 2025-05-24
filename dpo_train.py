@@ -21,6 +21,8 @@ from transformers import GPT2Config
 # from MCMG_utils.data_structs import Experience
 # from utils import Variable, unique, read_data, decode
 from torch.utils.data import Dataset, DataLoader
+import wandb
+from utils.utils import cal_loss_and_accuracy, gce_loss_and_accuracy
 
 class MyDataset(Dataset):
     def __init__(self, data_list):
@@ -163,7 +165,41 @@ def get_log_probs(model, tokenizer, protein_batch, input_ids):
     return log_probs
 
 
-def train(dataloader, ref_model, train_model, args):
+def evaluate(model, dataloader, args, step):
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # model = GPT2LMHeadModel.from_pretrained(args.save_model_path)
+    # model.load_state_dict(torch.load('final_model_early_stop.pt'))
+
+    # model.to(device)
+    model.eval()
+    loss_list, acc_list = [], []
+    batch_steps = 0
+    # early_stopping = EarlyStopping(patience=20, verbose=False)
+    print("Eval...")
+    with torch.no_grad():
+        for mix_batch in dataloader:
+            batch, _, protein_batch = mix_batch
+            batch_steps += 1
+            batch = batch.to(device)
+            protein_batch = protein_batch.to(device)
+            outputs = model(batch, protein_batch)
+
+            loss, acc = gce_loss_and_accuracy(outputs, batch.to(device), device)
+            loss_list.append(float(loss))
+            acc_list.append(float(acc))
+
+    # epoch_loss = np.mean(loss_list)
+    # early_stopping(epoch_loss, model, args.early_stop_path)
+
+    wandb.log({
+        'step': step,
+        "val_loss": np.mean(loss_list),
+        "examples_seen": step * args.batch_size
+    })
+    print("val_loss: {},".format(np.mean(loss_list)))
+
+def train(dataloader, eval_loader, ref_model, train_model, args):
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # rank, world_size = setup(rank, world_size)
     # torch.cuda.set_device(rank)
 
@@ -177,7 +213,7 @@ def train(dataloader, ref_model, train_model, args):
     for param in ref_model.parameters():
         param.requires_grad = False
 
-    optimizer = torch.optim.RMSprop(train_model.parameters(), lr=1e-6)  # default lr=1e-4
+    optimizer = torch.optim.RMSprop(train_model.parameters(), lr=args.lr)  # default lr=1e-4
 
     # protein_emb = next(Path(protein_dir).glob('*.pkl'))
     # single_protein = read_data(protein_emb)
@@ -190,14 +226,16 @@ def train(dataloader, ref_model, train_model, args):
     print("Model initialized, starting training...")
     train_model.train()
     ref_model.eval()
+    val_freq = len(dataloader)
+    step = 0
     for epoch in range(args.num_epochs):
-        for mix_batch in dataloader:
+        for mix_batch in tqdm(dataloader, total=len(dataloader)):           
             optimizer.zero_grad()
             # get ids of tokens of ligand, and protein matrix
             lig_batch_win, lig_batch_lose , protein_batch = mix_batch
-            # protein_batch = torch.tensor(protein_batch)
-            # lig_batch_win = torch.tensor(lig_batch_win)
-            # lig_batch_lose = torch.tensor(lig_batch_lose)
+            protein_batch = protein_batch.to(device)
+            lig_batch_win = lig_batch_win.to(device)
+            lig_batch_lose = lig_batch_lose.to(device)
             log_probs_win = get_log_probs(train_model, tokenizer, protein_batch, lig_batch_win)
             log_probs_lose = get_log_probs(train_model, tokenizer, protein_batch, lig_batch_lose)
             # print(log_probs_win.shape)
@@ -205,12 +243,19 @@ def train(dataloader, ref_model, train_model, args):
             with torch.no_grad():
                 log_probs_win_ref = get_log_probs(ref_model, tokenizer, protein_batch, lig_batch_win)
                 log_probs_lose_ref = get_log_probs(ref_model, tokenizer, protein_batch, lig_batch_lose)
-            loss = dpo_loss(log_probs_win, log_probs_lose, log_probs_win_ref, log_probs_lose_ref)
+            loss = dpo_loss(log_probs_win, log_probs_lose, log_probs_win_ref, log_probs_lose_ref, args.beta)
             # print(loss.shape)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.max_grad_norm)
             optimizer.step()
-            print(loss)
+            # print(loss)
+            wandb.log({
+                'step': step,
+                "dpo_loss": loss.item(),
+                "examples_seen": step * args.batch_size
+            })
+            step += 1
+        evaluate(train_model, eval_loader, args, step)
 
 
 if __name__ == "__main__":
@@ -233,12 +278,23 @@ if __name__ == "__main__":
                         default='./usecase_protein_embedding/CDK4',
                         help='Path where store protein target informations.')
     parser.add_argument('--max_grad_norm', default=1.0, type=float, required=False)
+    parser.add_argument('--beta', default=0.1)
+    parser.add_argument('--lr', default=1e-6)
     
     # parser.add_argument('--save-file-path', action='store', dest='save_dir',
     # help='Path where results and model are saved. Default is data/results/run_<datetime>.')
 
     args = parser.parse_args()
     args_list = list(vars(args).values())
+
+    wandb.init(
+        project='dpo_train_224r',
+        config={
+            'batch_size': args.batch_size,
+            'beta': args.beta,
+            'lr': args.lr
+        }
+    )
 
     ref_model = Token3D(pretrain_path='/home/ubuntu/cs224r_project/token_mol/Token-Mol/Pretrained_model', config=Ada_config)
     train_model = Token3D(pretrain_path='/home/ubuntu/cs224r_project/token_mol/Token-Mol/Pretrained_model', config=Ada_config)
@@ -250,7 +306,10 @@ if __name__ == "__main__":
                         torch.load(restore_from, map_location='cuda').items()}
     ref_model.load_state_dict(ref_dict)
     train_model.load_state_dict(train_dict)
-
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    
+    ref_model.to(device)
+    train_model.to(device)
     # contains list of protein matrices
     with open('protein_data.pkl', 'rb') as f:
         protein_matrix = pickle.load(f)
@@ -259,10 +318,11 @@ if __name__ == "__main__":
         mol_data_win = pickle.load(f)[:len(protein_matrix)]
     with open('lose_data.pkl', 'rb') as f:
         mol_data_lose = pickle.load(f)[:len(protein_matrix)]
-
+    val_size = 100
     tokenizer = ExpressionBertTokenizer('/home/ubuntu/cs224r_project/data_2/torsion_version/torsion_voc_pocket.csv')
-    train_dataloader = data_loader(args, mol_data_win, mol_data_lose, protein_matrix, tokenizer=tokenizer, shuffle=True)
-    train(train_dataloader, ref_model, train_model, args)
+    train_dataloader = data_loader(args, mol_data_win[val_size:], mol_data_lose[val_size:], protein_matrix[val_size:], tokenizer=tokenizer, shuffle=True)
+    val_dataloader = data_loader(args, mol_data_win[:val_size], mol_data_lose[:val_size], protein_matrix[:val_size], tokenizer=tokenizer, shuffle=True)
+    train(train_dataloader, val_dataloader, ref_model, train_model, args)
 
     # args_list.append(Prior)
     # args_list.append(Agent)
