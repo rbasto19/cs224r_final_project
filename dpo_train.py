@@ -121,15 +121,24 @@ def dpo_loss(
     log_probs_lose_ref,
     reward_win,
     reward_lose,
+    response_len,
     beta=0.1,
-    regularize=True
+    regularize=True,
 ):
     out = beta * (log_probs_win - log_probs_lose - (log_probs_win_ref - log_probs_lose_ref))
-    out = torch.log(torch.sigmoid(out))  
+    out = torch.nn.functional.logsigmoid(out)
     # add regularization
     if regularize:
-        reg = torch.sigmoid(-1 * (reward_win - reward_lose))
-        out = reg * out + (1 - reg) * (1 - out)
+        # print("regularizing")
+        # AliDiff regularization
+        if response_len is None:
+            reg = torch.sigmoid(-1 * (reward_win - reward_lose))
+            out = reg * out + (1 - reg) * (1 - out)
+        else: 
+            # Llama-like regularization
+            alpha = 0.2
+            reg = alpha * log_probs_win / response_len
+            out += reg
     return torch.mean(-1 * out)
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
@@ -182,6 +191,18 @@ def get_log_probs(model, tokenizer, protein_batch, input_ids):
 
     return log_probs
 
+def get_diversity(list_ligands):
+    all_mols = construct_molobj(list_ligands)
+    fps = [AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+        for mol in all_mols if mol is not None]
+    n = len(fps)
+    sims = []
+    for i in range(n):
+        for j in range(i+1, n):
+            sim = DataStructs.TanimotoSimilarity(fps[i], fps[j])
+            sims.append(sim)
+    avg_sim = np.mean(sims) if sims else 0
+    return 1 - avg_sim
 
 def evaluate(model, tokenizer, dataloader, args, step, protein_dirs, protein_encodings, timestamp):
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -224,34 +245,33 @@ def evaluate(model, tokenizer, dataloader, args, step, protein_dirs, protein_enc
     # generate
     gen_ligands = []
     list_ligands = []
+    ligands_for_val = []
     print("Predicting...")
     for protein in tqdm(protein_encodings):
-        predictions = predict(model, tokenizer, 2, protein)
+        predictions = predict(model, tokenizer, 5, protein)
         decoded_preds = []
         for prediction in predictions:
             decoded_preds.append(decode(prediction))
         # print(decoded_preds)
         gen_ligands.append(decoded_preds)
+        ligands_for_val.append(decoded_preds[:1])
         list_ligands += decoded_preds
     
     print("Computing diversity...")
-    all_mols = construct_molobj(list_ligands)
-    fps = [AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
-           for mol in all_mols if mol is not None]
-    n = len(fps)
-    sims = []
-    for i in range(n):
-        for j in range(i+1, n):
-            sim = DataStructs.TanimotoSimilarity(fps[i], fps[j])
-            sims.append(sim)
-    avg_sim = np.mean(sims) if sims else 0
-    diversity = 1 - avg_sim
+    div_list = []
+    for ligands in gen_ligands:
+        div_list.append(get_diversity(ligands))
+    diversity = np.mean(div_list)
+
     print("Computing Lipinski...")
+    all_mols = construct_molobj(list_ligands)
     for mol in all_mols:
         if mol is not None:
             lipinski_score.append(obey_lipinski(mol))
+    
+
     print("Scoring...")
-    for protein_dir, smiles_torsions in tqdm(zip(protein_dirs, gen_ligands), total=len(protein_dirs)):
+    for protein_dir, smiles_torsions in tqdm(zip(protein_dirs, ligands_for_val), total=len(protein_dirs)):
         mols = construct_molobj(smiles_torsions)
         protein_file = protein_dir.split('/')[-1]
         ligand_file = protein_dir.split('_pocket10.pdb')[0] + '.sdf'
@@ -342,7 +362,8 @@ def train(dataloader, eval_loader, ref_model, train_model, args, protein_dirs, p
             with torch.no_grad():
                 log_probs_win_ref = get_log_probs(ref_model, tokenizer, protein_batch, lig_batch_win)
                 log_probs_lose_ref = get_log_probs(ref_model, tokenizer, protein_batch, lig_batch_lose)
-            loss = dpo_loss(log_probs_win, log_probs_lose, log_probs_win_ref, log_probs_lose_ref, aff_win, aff_lose, args.beta, regularize=True)
+            response_len = torch.tensor([len(ids) for ids in lig_batch_win]).to(device) if args.reg_type == 'llama' else None
+            loss = dpo_loss(log_probs_win, log_probs_lose, log_probs_win_ref, log_probs_lose_ref, aff_win, aff_lose, response_len=response_len, beta=args.beta, regularize=args.regularize)
             # print(loss.shape)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.max_grad_norm)
@@ -377,9 +398,14 @@ if __name__ == "__main__":
                         default='./usecase_protein_embedding/CDK4',
                         help='Path where store protein target informations.')
     parser.add_argument('--max_grad_norm', default=1.0, type=float, required=False)
-    parser.add_argument('--beta', default=0.1)
+    parser.add_argument('--beta', default=0.1, type=float)
     parser.add_argument('--lr', default=1e-6)
-    
+    parser.add_argument('--regularize', default=1, type=int)
+    parser.add_argument('--reg_type', default="llama")
+    seed = 42
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     # parser.add_argument('--save-file-path', action='store', dest='save_dir',
     # help='Path where results and model are saved. Default is data/results/run_<datetime>.')
 
@@ -423,7 +449,7 @@ if __name__ == "__main__":
         affinities_win.append(min(affinities))
         affinities_lose.append(max(affinities))
     
-    val_size = 2
+    val_size = 10
     wandb.init(
         project='dpo_train_224r',
         config={
@@ -431,7 +457,9 @@ if __name__ == "__main__":
             'beta': args.beta,
             'lr': args.lr,
             "val_size": val_size,
-            "train_size": len(protein_dirs)
+            "train_size": len(protein_dirs),
+            "regularize": args.regularize,
+            "reg_type": args.reg_type
         }
     )
     tokenizer = ExpressionBertTokenizer('/home/ubuntu/cs224r_project/data_2/torsion_version/torsion_voc_pocket.csv')
