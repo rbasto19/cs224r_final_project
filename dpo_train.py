@@ -31,6 +31,8 @@ from datetime import datetime
 from copy import deepcopy
 from rdkit.Chem import AllChem, Descriptors, Crippen, Lipinski
 from rdkit.Chem.FilterCatalog import *
+from pocket_fine_tuning_rmse import read_data
+protein_path = '/home/ubuntu/cs224r_project/ARA2A.pkl'
 
 class MyDataset(Dataset):
     def __init__(self, data_list):
@@ -282,7 +284,7 @@ def evaluate(model, tokenizer, dataloader, args, step, protein_dirs, protein_enc
             sa_list.extend(scores['sa'])
         valid += scores['valid_count']
         total += scores['total_count']
-    # epoch_loss = np.mean(loss_list)
+    epoch_loss = np.mean(loss_list)
     # early_stopping(epoch_loss, model, args.early_stop_path)
 
     wandb.log({
@@ -310,6 +312,24 @@ def evaluate(model, tokenizer, dataloader, args, step, protein_dirs, protein_enc
             "sa": sa_list,
             "lipinski": lipinski_score
         }, f)
+    
+    eval_data_protein = read_data(protein_path)
+    print('Model is loaded, now start generation...')
+    all_output = []
+    # Total number = range * batch size
+    for pocket in eval_data_protein:
+        one_output = []
+        Seq_all = []
+        for i in range(1):
+            Seq_list = predict(model, tokenizer, single_pocket=pocket,batch_size=6)
+            Seq_all.extend(Seq_list)
+        for j in Seq_all:
+            one_output.append(decode(j))
+        all_output.append(one_output)
+    all_mols = construct_molobj(all_output[0])
+    with open(f'generation_ara2a_ours_{step}.pkl', 'wb') as f:
+        pickle.dump(all_mols, f)
+    
     # print("val_loss: {},".format(np.mean(loss_list)))
     # print("avg_score: {},".format(np.mean(score_list)))
 
